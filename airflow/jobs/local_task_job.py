@@ -21,6 +21,9 @@ import os
 import signal
 from typing import Optional
 
+from pendulum import utcfromtimestamp
+from sqlalchemy import or_
+
 from airflow.configuration import conf
 from airflow.exceptions import AirflowException
 from airflow.jobs.base_job import BaseJob
@@ -28,6 +31,8 @@ from airflow.models.taskinstance import TaskInstance
 from airflow.stats import Stats
 from airflow.task.task_runner import get_task_runner
 from airflow.utils import timezone
+from airflow.utils.dag_processing import SimpleTaskInstance
+from airflow.utils.helpers import create_redis_connection
 from airflow.utils.net import get_hostname
 from airflow.utils.session import provide_session
 from airflow.utils.state import State
@@ -41,6 +46,8 @@ class LocalTaskJob(BaseJob):
     __mapper_args__ = {
         'polymorphic_identity': 'LocalTaskJob'
     }
+
+    redis_batch_size = conf.getint('heartbeat', 'redis_get_batch_size')
 
     def __init__(
             self,
@@ -170,3 +177,78 @@ class LocalTaskJob(BaseJob):
                 ti.task.on_success_callback(context)
             self.task_runner.terminate()
             self.terminating = True
+
+
+    @classmethod
+    def get_zombie_running_tis(cls, limit_dttm, logger, session=None):
+        TI = TaskInstance
+
+        if cls.redis_enabled:
+            with create_redis_connection(conf.get('heartbeat', 'redis_url')) as redis_client:
+                def batch_get(items):
+                    # Redis has no batch functionality for zscore
+                    # see https://github.com/antirez/redis/issues/2344
+                    lua_script = '''
+                        local res = {}
+                        while #ARGV > 0 do
+                            res[#res+1] = redis.call('ZSCORE', KEYS[1], table.remove(ARGV, 1))
+                        end
+                        return res
+                    '''
+                    from airflow.jobs.local_task_job import LocalTaskJob
+                    batch_starts_at = time.time()
+
+                    res = redis_client.register_script(lua_script)(keys=[LocalTaskJob.__name__], args=items)
+
+                    logger.info('Loading %s heartbeats, time: %s', len(res), time.time() - batch_starts_at)
+
+                    return res
+
+                ti_job = session.query(TI, cls).join(cls, TI.job_id==cls.id).filter(TI.state==State.RUNNING).all()
+
+                job_id_to_ti_job = dict([(job.id, (ti, job)) for ti, job in ti_job])
+                job_ids = list(job_id_to_ti_job.keys())
+
+                zombie_tis = []
+                for idx in range(0, len(job_ids), cls.redis_batch_size):
+                    try:
+                        batch_job_ids = job_ids[idx:idx+cls.redis_batch_size]
+                        heartbeats = batch_get(batch_job_ids)
+
+                        for heartbeat_epoch, job_id in zip(heartbeats, batch_job_ids):
+                            ti, job = job_id_to_ti_job[job_id]
+
+                            heartbeat = heartbeat_epoch and utcfromtimestamp(float(heartbeat_epoch))
+                            # fallback to job._orm_heartbeat so that
+                            # during rolling out, it will not cause zombies as there are long running tasks
+                            if ((not heartbeat and job._orm_heartbeat < limit_dttm) or
+                                    (heartbeat and heartbeat < limit_dttm) or
+                                    job.state != State.RUNNING):
+                                sti = SimpleTaskInstance(ti)
+                                logger.info(
+                                    "Detected zombie job_id %s with dag_id %s, task_id %s, and execution date %s and heartbeat %s",
+                                    job_id, sti.dag_id, sti.task_id, sti.execution_date.isoformat(), heartbeat)
+                                zombie_tis.append(sti)
+                    except Exception as e:
+                        logger.exception('Exception happened while handling batch %s, but still keep processing rest batch', idx)
+
+                return zombie_tis
+        else:
+            tis = (
+                session
+                .query(TI)
+                .join(cls, TI.job_id == cls.id)
+                .filter(TI.state == State.RUNNING)
+                .filter(
+                    or_(
+                        cls.state != State.RUNNING,
+                        cls._orm_heartbeat < limit_dttm,
+                    )
+                ).all()
+            )
+            zombies = [SimpleTaskInstance(ti) for ti in tis]
+            for sti in zombies:
+                logger.info(
+                    "Detected zombie job with dag_id %s, task_id %s, and execution date %s",
+                    sti.dag_id, sti.task_id, sti.execution_date.isoformat())
+            return zombies

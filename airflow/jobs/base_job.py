@@ -21,6 +21,7 @@ import getpass
 from time import sleep
 from typing import Optional
 
+from pendulum import utcfromtimestamp
 from sqlalchemy import Column, Index, Integer, String
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import backref, relationship
@@ -33,7 +34,7 @@ from airflow.models.base import ID_LEN, Base
 from airflow.models.taskinstance import TaskInstance
 from airflow.stats import Stats
 from airflow.utils import timezone
-from airflow.utils.helpers import convert_camel_to_snake
+from airflow.utils.helpers import convert_camel_to_snake, create_redis_connection
 from airflow.utils.log.logging_mixin import LoggingMixin
 from airflow.utils.net import get_hostname
 from airflow.utils.session import create_session, provide_session
@@ -57,10 +58,14 @@ class BaseJob(Base, LoggingMixin):
     job_type = Column(String(30))
     start_date = Column(UtcDateTime())
     end_date = Column(UtcDateTime())
-    latest_heartbeat = Column(UtcDateTime())
     executor_class = Column(String(500))
     hostname = Column(String(500))
     unixname = Column(String(1000))
+    """
+    because this can be backed by sqlalchemy or redis, name is underscored so
+    users can use get_heartbeat and update_heartbeat
+    """
+    _orm_heartbeat = Column(UtcDateTime())
 
     __mapper_args__ = {
         'polymorphic_on': job_type,
@@ -68,8 +73,8 @@ class BaseJob(Base, LoggingMixin):
     }
 
     __table_args__ = (
-        Index('job_type_heart', job_type, latest_heartbeat),
-        Index('idx_job_state_heartbeat', state, latest_heartbeat),
+        Index('job_type_heart', job_type, _orm_heartbeat),
+        Index('idx_job_state_heartbeat', state, _orm_heartbeat),
     )
 
     task_instances_enqueued = relationship(
@@ -85,6 +90,7 @@ class BaseJob(Base, LoggingMixin):
     """
 
     heartrate = conf.getfloat('scheduler', 'JOB_HEARTBEAT_SEC')
+    redis_enabled = conf.getboolean('heartbeat', 'redis_enabled')
 
     def __init__(
             self,
@@ -95,7 +101,7 @@ class BaseJob(Base, LoggingMixin):
         self.executor = executor or ExecutorLoader.get_default_executor()
         self.executor_class = self.executor.__class__.__name__
         self.start_date = timezone.utcnow()
-        self.latest_heartbeat = timezone.utcnow()
+        self._orm_heartbeat = timezone.utcnow()
         if heartrate is not None:
             self.heartrate = heartrate
         self.unixname = getpass.getuser()
@@ -115,7 +121,15 @@ class BaseJob(Base, LoggingMixin):
         :param session: Database session
         :rtype: BaseJob or None
         """
-        return session.query(cls).order_by(cls.latest_heartbeat.desc()).limit(1).first()
+        latest_job_sql = session.query(cls).order_by(cls._orm_heartbeat.desc()).limit(1).first()
+        if cls.redis_enabled:
+            with create_redis_connection(conf.get('heartbeat', 'redis_url')) as redis_client:
+                latest_id = redis_client.zrange(cls.__name__, -1, -1)
+                latest_job_redis = latest_id and session.query(cls).get(int(latest_id))
+
+                return latest_job_redis
+        else:
+            return latest_job_sql
 
     def is_alive(self, grace_multiplier=2.1):
         """
@@ -189,13 +203,16 @@ class BaseJob(Base, LoggingMixin):
         if seconds_remaining > 0 and only_if_necessary:
             return
 
-        previous_heartbeat = self.latest_heartbeat
+        if self.redis_enabled:
+            import redis
+            HeartbeatExceptionToCatch = (redis.RedisError, OperationalError) # parent class of all redis exceptions
+        else:
+            HeartbeatExceptionToCatch = OperationalError
 
         try:
             with create_session() as session:
                 # This will cause it to load from the db
                 session.merge(self)
-                previous_heartbeat = self.latest_heartbeat
 
             if self.state == State.SHUTDOWN:
                 self.kill()
@@ -209,24 +226,44 @@ class BaseJob(Base, LoggingMixin):
                 sleep_for = max(0, seconds_remaining)
             sleep(sleep_for)
 
-            # Update last heartbeat time
-            with create_session() as session:
-                # Make the sesion aware of this object
-                session.merge(self)
-                self.latest_heartbeat = timezone.utcnow()
-                session.commit()
-                # At this point, the DB has updated.
-                previous_heartbeat = self.latest_heartbeat
+            self.update_heartbeat()
 
-                self.heartbeat_callback(session=session)
-                self.log.debug('[heartbeat]')
-        except OperationalError:
+            self.heartbeat_callback(session=session)
+            self.log.debug('[heartbeat]')
+        except HeartbeatExceptionToCatch:
             Stats.incr(
                 convert_camel_to_snake(self.__class__.__name__) + '_heartbeat_failure', 1,
                 1)
             self.log.exception("%s heartbeat got an exception", self.__class__.__name__)
-            # We didn't manage to heartbeat, so make sure that the timestamp isn't updated
-            self.latest_heartbeat = previous_heartbeat
+
+    def update_heartbeat(self, heartbeat_time=None):
+        if heartbeat_time is None:
+            heartbeat_time = timezone.utcnow()
+
+        self.logger.info('Updating heartbeat: %s', heartbeat_time)
+
+        if self.redis_enabled:
+            with create_redis_connection(conf.get('heartbeat', 'redis_url')) as redis_client:
+                redis_client.zadd(
+                    self.job_type,
+                    {str(self.id): str((heartbeat_time - timezone.utc_epoch()).total_seconds())})
+        else:
+            with create_session() as session:
+                self._orm_heartbeat = heartbeat_time
+
+                session.merge(self)
+                session.commit()
+
+    @property
+    def latest_heartbeat(self):
+        if self.redis_enabled:
+            with create_redis_connection(conf.get('heartbeat', 'redis_url')) as redis_client:
+                redis_result = redis_client.zscore(self.job_type, str(self.id))
+                # fallback to self._orm_heartbeat so that
+                # during rolling out, it will not cause zombies as there are long running tasks
+                return (redis_result and utcfromtimestamp(redis_result)) or self._orm_heartbeat
+        else:
+            return self._orm_heartbeat
 
     def run(self):
         """
@@ -239,6 +276,9 @@ class BaseJob(Base, LoggingMixin):
             session.add(self)
             session.commit()
             make_transient(self)
+
+            # heartbeat when the id is available
+            self.update_heartbeat()
 
             try:
                 self._execute()

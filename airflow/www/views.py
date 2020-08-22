@@ -2585,11 +2585,9 @@ class JobModelView(AirflowModelView):
     base_permissions = ['can_list']
 
     list_columns = ['id', 'dag_id', 'state', 'job_type', 'start_date',
-                    'end_date', 'latest_heartbeat',
-                    'executor_class', 'hostname', 'unixname']
+                    'end_date', 'executor_class', 'hostname', 'unixname']
     search_columns = ['id', 'dag_id', 'state', 'job_type', 'start_date',
-                      'end_date', 'latest_heartbeat', 'executor_class',
-                      'hostname', 'unixname']
+                      'end_date', 'executor_class', 'hostname', 'unixname']
 
     base_order = ('start_date', 'desc')
 
@@ -2600,7 +2598,6 @@ class JobModelView(AirflowModelView):
         'end_date': wwwutils.datetime_f('end_date'),
         'hostname': wwwutils.nobr_f('hostname'),
         'state': wwwutils.state_f,
-        'latest_heartbeat': wwwutils.datetime_f('latest_heartbeat'),
     }
 
 

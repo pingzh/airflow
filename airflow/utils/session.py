@@ -23,6 +23,18 @@ from airflow import settings
 
 
 @contextlib.contextmanager
+def create_redis_connection(redis_url):
+    """
+    Contextmanager that will create and close redis connection.
+    """
+    import redis
+    redis_client = redis.Redis.from_url(redis_url)
+    try:
+        yield redis_client
+    finally:
+        redis_client.connection_pool.disconnect()
+
+@contextlib.contextmanager
 def create_session():
     """
     Contextmanager that will create and teardown a session.

@@ -1179,24 +1179,24 @@ class DagFileProcessorManager(LoggingMixin):  # pylint: disable=too-many-instanc
             limit_dttm = timezone.utcnow() - timedelta(seconds=self._zombie_threshold_secs)
             self.log.info("Failing jobs without heartbeat after %s", limit_dttm)
 
-            zombies = (
-                session.query(TI, DM.fileloc)
-                .join(LJ, TI.job_id == LJ.id)
-                .join(DM, TI.dag_id == DM.dag_id)
-                .filter(TI.state == State.RUNNING)
-                .filter(
-                    or_(
-                        LJ.state != State.RUNNING,
-                        LJ.latest_heartbeat < limit_dttm,
-                    )
-                ).all()
-            )
+            zombies = LocalTaskJob.get_zombie_running_tis(limit_dttm, self.log, session=session)
+            self.log.info("Failing %s jobs without heartbeat after %s", len(zombies), limit_dttm)
 
             self._last_zombie_query_time = timezone.utcnow()
-            for ti, file_loc in zombies:
+
+            zombie_dag_ids = list(map(lambda sti: sti.dag_id, zombies))
+            dag_id_to_fileloc = dict(
+                session.query(DM.dag_id, DM.fileloc).filter(DM.dag_id.in_(zombie_dag_ids)).all()
+            )
+            for si in zombies:
+                if si.dag_id not in dag_id_to_fileloc:
+                    continue
+
+                fileloc = dag_id_to_fileloc[si.dag_id]
+
                 request = FailureCallbackRequest(
                     full_filepath=file_loc,
-                    simple_task_instance=SimpleTaskInstance(ti),
+                    simple_task_instance=si,
                     msg="Detected as zombie",
                 )
                 self.log.info("Detected zombie job: %s", request)
