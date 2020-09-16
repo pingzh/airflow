@@ -44,6 +44,7 @@ from airflow.serialization.json_schema import Validator, load_dag_schema
 from airflow.settings import json
 from airflow.utils.code_utils import get_python_source
 from airflow.utils.module_loading import import_string
+from airflow.utils.operator_resources import Resources
 
 log = logging.getLogger(__name__)
 FAILED = 'serialization_failed'
@@ -180,6 +181,8 @@ class BaseSerialization:
                 if isinstance(var, enum.Enum):
                     return var.value
                 return var
+            elif isinstance(var, Resources):
+                return json.dumps(var.to_dict())
             elif isinstance(var, dict):
                 return cls._encode(
                     {str(k): cls._serialize(v) for k, v in var.items()},
@@ -390,6 +393,10 @@ class SerializedBaseOperator(BaseOperator, BaseSerialization):
 
             if k == "_downstream_task_ids":
                 v = set(v)
+            elif k == "resources" and Resources.is_operator_resources_json_string(v):
+            # there are other values with the same key as `resources` so adding a check of
+            # is_operator_resources_json_string
+                v = Resources.from_json(v)
             elif k == "subdag":
                 v = SerializedDAG.deserialize_dag(v)
             elif k in {"retry_delay", "execution_timeout"}:

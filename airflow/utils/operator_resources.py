@@ -18,6 +18,7 @@
 
 from airflow.configuration import conf
 from airflow.exceptions import AirflowException
+from json import json
 
 # Constants for resources (megabytes are the base unit)
 MB = 1
@@ -77,6 +78,13 @@ class Resource:
         execution of the operator.
         """
         return self._qty
+
+    def to_dict(self):
+        return {
+            'name': self.name,
+            'qty': self.qty,
+            'units_str': self.units_str,
+        }
 
 
 class CpuResource(Resource):
@@ -141,3 +149,34 @@ class Resources:
 
     def __repr__(self):
         return str(self.__dict__)
+
+    def to_dict(self):
+        obj = {
+            'cpus': self.cpus.to_dict(),
+            'ram': self.ram.to_dict(),
+            'disk': self.disk.to_dict(),
+            'gpus': self.gpus.to_dict(),
+        }
+
+    @classmethod
+    def is_operator_resources_json_string(cls, json_str):
+        """
+        Given a json string, determine if it is a serialization of the operator resources
+        """
+        try:
+            cls.from_json(json_str)
+
+            return True
+        except (ValueError, KeyError) as e:
+            return False
+
+    @classmethod
+    def from_json(cls, json_str):
+        data = json.loads(json_str)
+
+        cpus = data['cpus']['qty']
+        ram = data['ram']['qty']
+        disk = data['disk']['qty']
+        gpus = data['gpus']['qty']
+
+        return cls(cpus=cpus, ram=ram, disk=disk, gpus=gpus)
